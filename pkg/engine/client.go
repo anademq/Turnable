@@ -10,15 +10,16 @@ import (
 	"sync/atomic"
 
 	"github.com/theairblow/turnable/pkg/config"
-	"github.com/theairblow/turnable/pkg/internal/connection"
+	"github.com/theairblow/turnable/pkg/connection"
 )
 
 // TurnableClient represents a Turnable client
 type TurnableClient struct {
-	Config config.ClientConfig
+	Config config.Config
 
 	running atomic.Bool
 	handler connection.Handler
+	events  <-chan connection.ConnectEvent
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -35,7 +36,7 @@ func (c *TurnableClient) SetLogger(log *slog.Logger) {
 }
 
 // NewTurnableClient creates a new Turnable client from the specified ClientConfig
-func NewTurnableClient(cfg config.ClientConfig) *TurnableClient {
+func NewTurnableClient(cfg config.Config) *TurnableClient {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TurnableClient{
 		Config: cfg,
@@ -61,19 +62,11 @@ func (c *TurnableClient) Start(listenAddrs []string) error {
 	socket := SocketHandler{}
 	socket.SetLogger(c.log)
 
-	connHandler, err := connection.GetHandler(c.Config.Type)
-	if err != nil {
-		return fmt.Errorf("get connection handler: %w", err)
+	if err := c.Config.Validate(); err != nil {
+		return fmt.Errorf("failed to validate client config: %w", err)
 	}
 
-	connHandler.SetLogger(c.log)
-
-	if err := connHandler.Connect(c.Config); err != nil {
-		_ = connHandler.Close()
-		return fmt.Errorf("connect: %w", err)
-	}
-
-	c.handler = connHandler
+	innerCfg := c.Config.GetInner().(config.ClientConfig)
 
 	baseAddr := "127.0.0.1:0"
 	if len(listenAddrs) > 0 {
@@ -90,7 +83,32 @@ func (c *TurnableClient) Start(listenAddrs []string) error {
 		return fmt.Errorf("invalid port in base listen address %q: %w", baseAddr, err)
 	}
 
-	for i, route := range c.Config.Routes {
+	connHandler, err := connection.GetHandler(innerCfg.Type)
+	if err != nil {
+		return fmt.Errorf("get connection handler: %w", err)
+	}
+
+	connHandler.SetLogger(c.log)
+
+	events, err := connHandler.Connect(c.Config)
+	if err != nil {
+		_ = connHandler.Close()
+		return fmt.Errorf("connect: %w", err)
+	}
+
+	out := connection.NewEventStream()
+	c.handler = connHandler
+	c.events = out.Chan()
+
+	go func() {
+		for ev := range events {
+			out.Publish(ev)
+		}
+		_ = c.Stop()
+		out.Close()
+	}()
+
+	for i, route := range innerCfg.Routes {
 		var addr string
 		if i < len(listenAddrs) {
 			addr = listenAddrs[i]
@@ -114,6 +132,11 @@ func (c *TurnableClient) Start(listenAddrs []string) error {
 // IsRunning returns whether the Turnable client is currently running
 func (c *TurnableClient) IsRunning() bool {
 	return c.running.Load()
+}
+
+// Events returns the connection handler's connectivity transition stream
+func (c *TurnableClient) Events() <-chan connection.ConnectEvent {
+	return c.events
 }
 
 // Stop stops the Turnable client
@@ -157,9 +180,6 @@ func (c *TurnableClient) handleClient(local AcceptedClient, routeIdx byte) {
 
 	channel, err := c.handler.OpenChannel(routeIdx)
 	if err != nil {
-		if !errors.Is(err, connection.ErrReconnecting) {
-			c.log.Warn("failed to open channel for local client", "error", err)
-		}
 		_ = local.Stream.Close()
 		return
 	}

@@ -3,6 +3,7 @@ package common
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -21,20 +22,35 @@ var (
 	cacheWarnOnce  sync.Once                    // cache warning sync
 )
 
+// defaultTTL is used for every entry since the native resolver does not expose real TTLs
+const defaultTTL = 5 * time.Minute
+
+const (
+	dnsCacheLocalName  = ".dns_cache"     // DNS cache file name in the working directory
+	dnsCacheGlobalName = "dns_cache.json" // DNS cache file name in the global config directory
+)
+
 // warmupDomains contains a list of domains to resolve when warmup is requested
 var warmupDomains = []string{
-	"vk.com",
-	"api.vk.com",
-	"login.vk.com",
-	"id.vk.com",
-	"static.vk.com",
+	"vk.ru",
+	"api.vk.ru",
+	"login.vk.ru",
+	"id.vk.ru",
+	"static.vk.ru",
 	"calls.okcdn.ru",
 	"videowebrtc.okcdn.ru",
 }
 
 // dnsCacheEntry describes one cached DNS answer
 type dnsCacheEntry struct {
-	IPs []string `json:"ips"`
+	IPs    []string  `json:"ips"`
+	TTL    int64     `json:"ttl_seconds"`
+	Expiry time.Time `json:"expiry"`
+}
+
+// fresh reports whether the cache entry has not yet reached its expiration date
+func (e dnsCacheEntry) fresh() bool {
+	return !e.Expiry.IsZero() && time.Now().Before(e.Expiry)
 }
 
 // dnsCacheFile is the JSON container for DNS cache
@@ -44,28 +60,12 @@ type dnsCacheFile struct {
 
 // init loads DNS cache state from disk
 func init() {
-	primary, fallback := cachePaths()
+	primary, fallback := CachePaths(dnsCacheLocalName, dnsCacheGlobalName)
 	if loadDNSCacheFrom(primary) {
 		return
 	}
 
 	loadDNSCacheFrom(fallback)
-}
-
-// cachePaths returns primary and fallback cache file paths
-func cachePaths() (string, string) {
-	fallback := ".dns_cache"
-	if cwd, err := os.Getwd(); err == nil {
-		fallback = filepath.Join(cwd, ".dns_cache")
-	}
-
-	configDir, err := os.UserConfigDir()
-	if err != nil || strings.TrimSpace(configDir) == "" {
-		return "", fallback
-	}
-
-	primary := filepath.Join(configDir, "turnable", "dns_cache.json")
-	return primary, fallback
 }
 
 // loadDNSCacheFrom loads cache entries from a single cache file path
@@ -108,7 +108,7 @@ func persistDNSCache() {
 		return
 	}
 
-	primary, fallback := cachePaths()
+	primary, fallback := CachePaths(dnsCacheLocalName, dnsCacheGlobalName)
 
 	if tryWriteCache(primary, data) == nil {
 		return
@@ -162,8 +162,8 @@ func cacheGet(host string) (dnsCacheEntry, bool) {
 	return entry, ok
 }
 
-// cacheSet updates a cache entry and persists cache to disk
-func cacheSet(host string, ips []net.IP) {
+// cacheSet updates a cache entry with its TTL-derived expiration and persists cache to disk
+func cacheSet(host string, ips []net.IP, ttl time.Duration) {
 	if len(ips) == 0 {
 		return
 	}
@@ -176,26 +176,53 @@ func cacheSet(host string, ips []net.IP) {
 	}
 
 	dnsCacheMu.Lock()
-	dnsCache[host] = dnsCacheEntry{IPs: stringsIP}
+	dnsCache[host] = dnsCacheEntry{
+		IPs:    stringsIP,
+		TTL:    int64(ttl.Seconds()),
+		Expiry: time.Now().Add(ttl),
+	}
 	dnsCacheMu.Unlock()
 	persistDNSCache()
 }
 
-// resolverLookup performs a native DNS lookup with timeout
-func resolverLookup(host string) ([]net.IP, error) {
+// bumpCacheExpiry extends every cached entry's expiration by its own last recorded TTL
+func bumpCacheExpiry() {
+	dnsCacheMu.Lock()
+	for host, entry := range dnsCache {
+		if entry.TTL <= 0 {
+			continue
+		}
+		entry.Expiry = entry.Expiry.Add(time.Duration(entry.TTL) * time.Second)
+		dnsCache[host] = entry
+	}
+	dnsCacheMu.Unlock()
+	persistDNSCache()
+}
+
+// isTimeout reports whether err represents a DNS request timeout
+func isTimeout(err error) bool {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// resolverLookup performs a native DNS lookup with timeout, returning addresses and their TTL
+func resolverLookup(host string) ([]net.IP, time.Duration, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	ips, err := globalResolver.LookupIP(ctx, "ip", host)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	if len(ips) == 0 {
-		return nil, fmt.Errorf("no addresses for %s", host)
+		return nil, 0, fmt.Errorf("no addresses for %s", host)
 	}
 
-	return ips, nil
+	return ips, defaultTTL, nil
 }
 
 // ResolveAll resolves and caches a predefined set of domains for warmup
@@ -211,7 +238,7 @@ func ResolveAll() error {
 	return nil
 }
 
-// Lookup resolves a hostname from native resolver, falling back to cache only on failure.
+// Lookup resolves a hostname, preferring a fresh cache entry over a new DNS request
 func Lookup(host string) ([]net.IP, error) {
 	host = normalizeHost(host)
 	if host == "" {
@@ -222,10 +249,20 @@ func Lookup(host string) ([]net.IP, error) {
 		return []net.IP{ip}, nil
 	}
 
-	resolvedIPs, err := resolverLookup(host)
+	if entry, cached := cacheGet(host); cached && entry.fresh() {
+		if cachedIPs := entryIPs(entry); len(cachedIPs) > 0 {
+			return cachedIPs, nil
+		}
+	}
+
+	resolvedIPs, ttl, err := resolverLookup(host)
 	if err == nil {
-		cacheSet(host, resolvedIPs)
+		cacheSet(host, resolvedIPs, ttl)
 		return resolvedIPs, nil
+	}
+
+	if isTimeout(err) {
+		bumpCacheExpiry()
 	}
 
 	entry, cached := cacheGet(host)
@@ -268,7 +305,7 @@ func ResolveUDPAddr(addr string) (*net.UDPAddr, error) {
 
 // ResolverDialContext returns a DialContext using the cached DNS resolver
 func ResolverDialContext() func(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	return func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(addr)
 		if err != nil {

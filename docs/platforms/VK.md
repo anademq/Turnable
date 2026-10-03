@@ -1,6 +1,17 @@
 # VKontakte &nbsp;·&nbsp; [🇷🇺 RU](VK_RU.md)
 The VKontakte platform module allows you to obtain authentication tokens through VK's video call system and make use of their TURN and SFU infrastructure. Follow this guide to set everything up securely without exposing your account to potential bans.
 
+## Platform Specifications
+| Feature                         | Value             | Notes                                                            |
+|---------------------------------|-------------------|------------------------------------------------------------------|
+| **Max TURN connections per IP** | 10                | Limits concurrent peer connections from same IP address          |
+| **Relay bandwidth limit**       | 250 KB/s per peer | Outbound rate limit per peer connection in relay mode            |
+| **P2P bandwidth limit**         | Unlimited         | No rate limiting in P2P mode                                     |
+| **TURN security**               | Insecure          | Platform allows arbitrary connections to any IP via TURN         |
+| **Auth security**               | Insecure          | Platform allows multiple anonymous identities from same IP       |
+| **Per-IP rate limiting**        | Yes               | TURN server limits are enforced per IP address, not account      |
+| **Shared TURN limits**          | No                | You can use 20 peers since VK provides 2 TURN servers by default |
+
 ## 1. Obtain a call ID
 To minimize the chance of tracing the request back to your VK account, obtain a public call ID by [searching `"vk.com/call/join"` on Google](https://www.google.com/search?q=%22vk.com%2Fcall%2Fjoin%22):
 
@@ -14,7 +25,7 @@ Turnable attempts to solve captchas automatically. However, if automatic solving
 ### 2.1. Obtain the tokens
 When automatic solving fails, you'll see a log message like this:
 ```
-2026-04-22 16:09:19.748 [INFO] manual captcha solve required userscript=http://localhost:1984/vk_manual_captcha.user.js guide=http://localhost:1984/ url=https://vk.com/call/join/... timeout=10m0s
+2026-04-22 16:09:19.748 [INFO] manual captcha solve required userscript=http://localhost:1984/captcha_manual.user.js guide=http://localhost:1984/ url=https://vk.com/call/join/... timeout=10m0s
 ```
 
 #### Step 1: Install TamperMonkey
